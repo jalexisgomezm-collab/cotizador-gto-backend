@@ -253,3 +253,146 @@ def listar_cotizaciones(limit: int = 50):
     )
     return res.data
 
+
+@app.put("/api/cotizaciones/{cotizacion_id}", response_model=CotizacionOut)
+def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
+    """Corrige una cotización ya existente y regenera el Word/PDF.
+    Mantiene el mismo número correlativo y la misma fecha de emisión;
+    todo lo demás (cliente, ítems, condiciones, moneda, etc.) se
+    sobreescribe con lo que llegue en el payload."""
+    sb = get_supabase()
+
+    existente = (
+        sb.table("cotizaciones")
+        .select("numero, fecha_emision")
+        .eq("id", cotizacion_id)
+        .maybe_single()
+        .execute()
+    )
+    if not existente.data:
+        raise HTTPException(status_code=404, detail="Cotización no encontrada.")
+
+    numero = existente.data["numero"]
+    fecha_emision = date.fromisoformat(existente.data["fecha_emision"])
+    vencimiento = fecha_emision + timedelta(days=payload.dias_validez)
+
+    # 1) upsert del cliente (por RUC, si lo tiene) — igual que en creación
+    cliente_dict = payload.cliente.dict()
+    if cliente_dict.get("ruc") and cliente_dict["ruc"] != "-":
+        cliente_row = sb.table("clientes").upsert(cliente_dict, on_conflict="ruc").execute()
+    else:
+        cliente_row = sb.table("clientes").insert(cliente_dict).execute()
+    cliente_id = cliente_row.data[0]["id"]
+
+    # 2) recalcular totales
+    subtotal = sum(i.cantidad * i.valor_unitario for i in payload.items)
+    igv = round(subtotal * payload.igv_pct / 100, 2) if payload.operacion_gravada else 0.0
+    total = subtotal + igv
+
+    # 3) datos del asesor (el mismo que ya tenía la cotización, salvo que el payload traiga otro)
+    asesor_dict = None
+    if payload.asesor_id:
+        try:
+            perfil_res = (
+                sb.table("profiles")
+                .select("nombre, celular, correo")
+                .eq("id", payload.asesor_id)
+                .maybe_single()
+                .execute()
+            )
+            if perfil_res.data:
+                asesor_dict = {
+                    "nombre": perfil_res.data.get("nombre") or "-",
+                    "celular": perfil_res.data.get("celular") or "-",
+                    "correo": perfil_res.data.get("correo") or "-",
+                }
+        except Exception:
+            asesor_dict = None
+
+    # 4) regenerar el .docx y el PDF con el mismo número
+    with tempfile.TemporaryDirectory() as tmp:
+        docx_path = os.path.join(tmp, f"Cotizacion_{numero}.docx")
+        try:
+            generar_cotizacion(
+                salida_path=docx_path,
+                numero_cotizacion=numero,
+                fecha_emision=fecha_emision.strftime("%d/%m/%Y"),
+                fecha_vencimiento=vencimiento.strftime("%d/%m/%Y"),
+                referencia=payload.referencia,
+                cliente=cliente_dict,
+                items=[Item(i.descripcion, i.cantidad, i.valor_unitario) for i in payload.items],
+                asesor=asesor_dict,
+                operacion_gravada=payload.operacion_gravada,
+                moneda_simbolo=payload.moneda_simbolo,
+                moneda_letras=payload.moneda_letras,
+                igv_pct=payload.igv_pct,
+                activities=payload.activities,
+                condiciones=payload.condiciones,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Error generando el Word: {exc}")
+
+        try:
+            subprocess.run(
+                ["soffice", "--headless", "--convert-to", "pdf", "--outdir", tmp, docx_path],
+                check=True, timeout=60, capture_output=True,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Error convirtiendo a PDF: {exc}")
+        pdf_path = docx_path[:-5] + ".pdf"
+
+        # 5) volver a subir ambos archivos a Supabase Storage, sobreescribiendo los anteriores
+        docx_key = f"{numero}/Cotizacion_{numero}.docx"
+        pdf_key = f"{numero}/Cotizacion_{numero}.pdf"
+        with open(docx_path, "rb") as f:
+            sb.storage.from_(BUCKET).upload(
+                docx_key, f.read(),
+                {
+                    "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "upsert": "true",
+                },
+            )
+        with open(pdf_path, "rb") as f:
+            sb.storage.from_(BUCKET).upload(
+                pdf_key, f.read(),
+                {"content-type": "application/pdf", "upsert": "true"},
+            )
+
+    docx_url = sb.storage.from_(BUCKET).get_public_url(docx_key)
+    pdf_url = sb.storage.from_(BUCKET).get_public_url(pdf_key)
+
+    # 6) actualizar la fila de la cotización
+    sb.table("cotizaciones").update({
+        "cliente_id": cliente_id,
+        "asesor_id": payload.asesor_id,
+        "referencia": payload.referencia,
+        "fecha_vencimiento": vencimiento.isoformat(),
+        "moneda_simbolo": payload.moneda_simbolo,
+        "moneda_letras": payload.moneda_letras,
+        "operacion_gravada": payload.operacion_gravada,
+        "igv_pct": payload.igv_pct,
+        "subtotal": subtotal,
+        "igv": igv,
+        "total": total,
+        "activities": payload.activities,
+        "condiciones": payload.condiciones,
+        "docx_url": docx_url,
+        "pdf_url": pdf_url,
+    }).eq("id", cotizacion_id).execute()
+
+    # 7) reemplazar los ítems (borrar los anteriores e insertar los nuevos)
+    sb.table("cotizacion_items").delete().eq("cotizacion_id", cotizacion_id).execute()
+    sb.table("cotizacion_items").insert([
+        {
+            "cotizacion_id": cotizacion_id,
+            "descripcion": i.descripcion,
+            "cantidad": i.cantidad,
+            "valor_unitario": i.valor_unitario,
+        }
+        for i in payload.items
+    ]).execute()
+
+    return CotizacionOut(
+        numero=numero, docx_url=docx_url, pdf_url=pdf_url,
+        subtotal=subtotal, igv=igv, total=total,
+    )
