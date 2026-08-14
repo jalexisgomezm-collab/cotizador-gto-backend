@@ -22,7 +22,7 @@ from datetime import date, timedelta
 from typing import List, Optional
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
@@ -156,6 +156,16 @@ def resolver_asesor(sb: Client, payload: "CotizacionIn") -> Optional[dict]:
     return asesor_dict
 
 
+def _liberar_numero(sb: Client, numero: str) -> None:
+    """Si algo falla después de sacar un número de cotización (antes de
+    guardarla), devuelve ese número al contador para que no quede
+    "quemado" sin usarse y la numeración no se salte."""
+    try:
+        sb.rpc("revertir_numero_si_no_se_uso", {"numero_int": int(numero)}).execute()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -218,107 +228,114 @@ def crear_cotizacion(payload: CotizacionIn):
     if not numero:
         raise HTTPException(status_code=500, detail="No se pudo obtener el número de cotización.")
 
-    hoy = date.today()
-    vencimiento = hoy + timedelta(days=payload.dias_validez)
+    try:
+        hoy = date.today()
+        vencimiento = hoy + timedelta(days=payload.dias_validez)
 
-    # 2) upsert del cliente (por RUC, si lo tiene)
-    cliente_dict = payload.cliente.dict()
-    if cliente_dict.get("ruc") and cliente_dict["ruc"] != "-":
-        cliente_row = sb.table("clientes").upsert(cliente_dict, on_conflict="ruc").execute()
-    else:
-        cliente_row = sb.table("clientes").insert(cliente_dict).execute()
-    cliente_id = cliente_row.data[0]["id"]
+        # 2) upsert del cliente (por RUC, si lo tiene)
+        cliente_dict = payload.cliente.dict()
+        if cliente_dict.get("ruc") and cliente_dict["ruc"] != "-":
+            cliente_row = sb.table("clientes").upsert(cliente_dict, on_conflict="ruc").execute()
+        else:
+            cliente_row = sb.table("clientes").insert(cliente_dict).execute()
+        cliente_id = cliente_row.data[0]["id"]
 
-    # 3) calcular totales
-    subtotal = sum(i.cantidad * i.valor_unitario for i in payload.items)
-    igv = round(subtotal * payload.igv_pct / 100, 2) if payload.operacion_gravada else 0.0
-    total = subtotal + igv
+        # 3) calcular totales
+        subtotal = sum(i.cantidad * i.valor_unitario for i in payload.items)
+        igv = round(subtotal * payload.igv_pct / 100, 2) if payload.operacion_gravada else 0.0
+        total = subtotal + igv
 
-    # 3.5) datos del asesor que va impreso en el documento
-    asesor_dict = resolver_asesor(sb, payload)
+        # 3.5) datos del asesor que va impreso en el documento
+        asesor_dict = resolver_asesor(sb, payload)
 
-    # 4) generar el .docx y convertirlo a PDF en una carpeta temporal
-    with tempfile.TemporaryDirectory() as tmp:
-        docx_path = os.path.join(tmp, f"Cotizacion_{numero}.docx")
-        try:
-            generar_cotizacion(
-                salida_path=docx_path,
-                numero_cotizacion=numero,
-                fecha_emision=hoy.strftime("%d/%m/%Y"),
-                fecha_vencimiento=vencimiento.strftime("%d/%m/%Y"),
-                referencia=payload.referencia,
-                cliente=cliente_dict,
-                items=[Item(i.descripcion, i.cantidad, i.valor_unitario) for i in payload.items],
-                asesor=asesor_dict,
-                operacion_gravada=payload.operacion_gravada,
-                moneda_simbolo=payload.moneda_simbolo,
-                moneda_letras=payload.moneda_letras,
-                igv_pct=payload.igv_pct,
-                activities=payload.activities,
-                condiciones=payload.condiciones,
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Error generando el Word: {exc}")
+        # 4) generar el .docx y convertirlo a PDF en una carpeta temporal
+        with tempfile.TemporaryDirectory() as tmp:
+            docx_path = os.path.join(tmp, f"Cotizacion_{numero}.docx")
+            try:
+                generar_cotizacion(
+                    salida_path=docx_path,
+                    numero_cotizacion=numero,
+                    fecha_emision=hoy.strftime("%d/%m/%Y"),
+                    fecha_vencimiento=vencimiento.strftime("%d/%m/%Y"),
+                    referencia=payload.referencia,
+                    cliente=cliente_dict,
+                    items=[Item(i.descripcion, i.cantidad, i.valor_unitario) for i in payload.items],
+                    asesor=asesor_dict,
+                    operacion_gravada=payload.operacion_gravada,
+                    moneda_simbolo=payload.moneda_simbolo,
+                    moneda_letras=payload.moneda_letras,
+                    igv_pct=payload.igv_pct,
+                    activities=payload.activities,
+                    condiciones=payload.condiciones,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Error generando el Word: {exc}")
 
-        try:
-            subprocess.run(
-                ["soffice", "--headless", "--convert-to", "pdf", "--outdir", tmp, docx_path],
-                check=True, timeout=60, capture_output=True,
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Error convirtiendo a PDF: {exc}")
-        pdf_path = docx_path[:-5] + ".pdf"
+            try:
+                subprocess.run(
+                    ["soffice", "--headless", "--convert-to", "pdf", "--outdir", tmp, docx_path],
+                    check=True, timeout=60, capture_output=True,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Error convirtiendo a PDF: {exc}")
+            pdf_path = docx_path[:-5] + ".pdf"
 
-        # 5) subir ambos archivos a Supabase Storage
-        docx_key = f"{numero}/Cotizacion_{numero}.docx"
-        pdf_key = f"{numero}/Cotizacion_{numero}.pdf"
-        with open(docx_path, "rb") as f:
-            sb.storage.from_(BUCKET).upload(
-                docx_key, f.read(),
-                {"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
-            )
-        with open(pdf_path, "rb") as f:
-            sb.storage.from_(BUCKET).upload(pdf_key, f.read(), {"content-type": "application/pdf"})
+            # 5) subir ambos archivos a Supabase Storage
+            docx_key = f"{numero}/Cotizacion_{numero}.docx"
+            pdf_key = f"{numero}/Cotizacion_{numero}.pdf"
+            with open(docx_path, "rb") as f:
+                sb.storage.from_(BUCKET).upload(
+                    docx_key, f.read(),
+                    {"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+                )
+            with open(pdf_path, "rb") as f:
+                sb.storage.from_(BUCKET).upload(pdf_key, f.read(), {"content-type": "application/pdf"})
 
-    docx_url = sb.storage.from_(BUCKET).get_public_url(docx_key)
-    pdf_url = sb.storage.from_(BUCKET).get_public_url(pdf_key)
+        docx_url = sb.storage.from_(BUCKET).get_public_url(docx_key)
+        pdf_url = sb.storage.from_(BUCKET).get_public_url(pdf_key)
 
-    # 6) guardar cotización + ítems en la base de datos
-    cot_row = sb.table("cotizaciones").insert({
-        "numero": numero,
-        "cliente_id": cliente_id,
-        "asesor_id": payload.asesor_id,
-        "referencia": payload.referencia,
-        "fecha_emision": hoy.isoformat(),
-        "fecha_vencimiento": vencimiento.isoformat(),
-        "moneda_simbolo": payload.moneda_simbolo,
-        "moneda_letras": payload.moneda_letras,
-        "operacion_gravada": payload.operacion_gravada,
-        "igv_pct": payload.igv_pct,
-        "subtotal": subtotal,
-        "igv": igv,
-        "total": total,
-        "activities": payload.activities,
-        "condiciones": payload.condiciones,
-        "docx_url": docx_url,
-        "pdf_url": pdf_url,
-    }).execute()
-    cotizacion_id = cot_row.data[0]["id"]
+        # 6) guardar cotización + ítems en la base de datos
+        cot_row = sb.table("cotizaciones").insert({
+            "numero": numero,
+            "cliente_id": cliente_id,
+            "asesor_id": payload.asesor_id,
+            "referencia": payload.referencia,
+            "fecha_emision": hoy.isoformat(),
+            "fecha_vencimiento": vencimiento.isoformat(),
+            "moneda_simbolo": payload.moneda_simbolo,
+            "moneda_letras": payload.moneda_letras,
+            "operacion_gravada": payload.operacion_gravada,
+            "igv_pct": payload.igv_pct,
+            "subtotal": subtotal,
+            "igv": igv,
+            "total": total,
+            "activities": payload.activities,
+            "condiciones": payload.condiciones,
+            "docx_url": docx_url,
+            "pdf_url": pdf_url,
+        }).execute()
+        cotizacion_id = cot_row.data[0]["id"]
 
-    sb.table("cotizacion_items").insert([
-        {
-            "cotizacion_id": cotizacion_id,
-            "descripcion": i.descripcion,
-            "cantidad": i.cantidad,
-            "valor_unitario": i.valor_unitario,
-        }
-        for i in payload.items
-    ]).execute()
+        sb.table("cotizacion_items").insert([
+            {
+                "cotizacion_id": cotizacion_id,
+                "descripcion": i.descripcion,
+                "cantidad": i.cantidad,
+                "valor_unitario": i.valor_unitario,
+            }
+            for i in payload.items
+        ]).execute()
 
-    return CotizacionOut(
-        numero=numero, docx_url=docx_url, pdf_url=pdf_url,
-        subtotal=subtotal, igv=igv, total=total,
-    )
+        return CotizacionOut(
+            numero=numero, docx_url=docx_url, pdf_url=pdf_url,
+            subtotal=subtotal, igv=igv, total=total,
+        )
+    except HTTPException:
+        _liberar_numero(sb, numero)
+        raise
+    except Exception as exc:
+        _liberar_numero(sb, numero)
+        raise HTTPException(status_code=500, detail=f"Error inesperado generando la cotización: {exc}")
 
 
 @app.get("/api/cotizaciones")
@@ -332,6 +349,104 @@ def listar_cotizaciones(limit: int = 50):
         .execute()
     )
     return res.data
+
+
+@app.post("/api/cotizaciones/importar", response_model=CotizacionOut)
+async def importar_cotizacion(
+    numero: str = Form(...),
+    ruc: str = Form("-"),
+    razon_social: str = Form(...),
+    direccion: str = Form("-"),
+    contacto: str = Form("-"),
+    telefono: str = Form("-"),
+    correo: str = Form("-"),
+    referencia: str = Form(""),
+    fecha_emision: str = Form(...),  # YYYY-MM-DD
+    moneda_simbolo: str = Form("US$"),
+    moneda_letras: str = Form("DÓLARES AMERICANOS"),
+    subtotal: float = Form(0),
+    igv: float = Form(0),
+    total: float = Form(0),
+    docx: UploadFile = File(...),
+    pdf: Optional[UploadFile] = File(None),
+):
+    """Registra una cotización hecha ANTES de este sistema: guarda sus
+    archivos Word/PDF originales tal cual (no se regeneran) y crea la fila
+    en la base de datos para que aparezca en el historial, con estado
+    'importada' (no se puede editar/regenerar, porque no viene de nuestra
+    plantilla)."""
+    sb = get_supabase()
+
+    numero = numero.strip()
+    if not numero:
+        raise HTTPException(status_code=400, detail="El número de cotización es obligatorio.")
+
+    existe = sb.table("cotizaciones").select("id").eq("numero", numero).maybe_single().execute()
+    if existe.data:
+        raise HTTPException(
+            status_code=400, detail=f"Ya existe una cotización con el número {numero}."
+        )
+
+    cliente_dict = {
+        "ruc": ruc.strip() or "-",
+        "razon_social": razon_social.strip(),
+        "direccion": direccion.strip() or "-",
+        "contacto": contacto.strip() or "-",
+        "telefono": telefono.strip() or "-",
+        "correo": correo.strip() or "-",
+    }
+    if cliente_dict["ruc"] != "-":
+        cliente_row = sb.table("clientes").upsert(cliente_dict, on_conflict="ruc").execute()
+    else:
+        cliente_row = sb.table("clientes").insert(cliente_dict).execute()
+    cliente_id = cliente_row.data[0]["id"]
+
+    try:
+        docx_bytes = await docx.read()
+        docx_key = f"{numero}/Cotizacion_{numero}.docx"
+        sb.storage.from_(BUCKET).upload(
+            docx_key, docx_bytes,
+            {
+                "content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "upsert": "true",
+            },
+        )
+        docx_url = sb.storage.from_(BUCKET).get_public_url(docx_key)
+
+        pdf_url = ""
+        if pdf is not None:
+            pdf_bytes = await pdf.read()
+            pdf_key = f"{numero}/Cotizacion_{numero}.pdf"
+            sb.storage.from_(BUCKET).upload(
+                pdf_key, pdf_bytes, {"content-type": "application/pdf", "upsert": "true"}
+            )
+            pdf_url = sb.storage.from_(BUCKET).get_public_url(pdf_key)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error subiendo los archivos: {exc}")
+
+    sb.table("cotizaciones").insert({
+        "numero": numero,
+        "cliente_id": cliente_id,
+        "asesor_id": None,
+        "referencia": referencia.strip(),
+        "fecha_emision": fecha_emision,
+        "fecha_vencimiento": fecha_emision,
+        "moneda_simbolo": moneda_simbolo,
+        "moneda_letras": moneda_letras,
+        "operacion_gravada": igv > 0,
+        "igv_pct": 18,
+        "subtotal": subtotal,
+        "igv": igv,
+        "total": total,
+        "docx_url": docx_url,
+        "pdf_url": pdf_url or None,
+        "estado": "importada",
+    }).execute()
+
+    return CotizacionOut(
+        numero=numero, docx_url=docx_url, pdf_url=pdf_url,
+        subtotal=subtotal, igv=igv, total=total,
+    )
 
 
 @app.put("/api/cotizaciones/{cotizacion_id}", response_model=CotizacionOut)
