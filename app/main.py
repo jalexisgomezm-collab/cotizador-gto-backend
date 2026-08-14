@@ -92,7 +92,10 @@ class CotizacionIn(BaseModel):
     igv_pct: int = 18
     activities: Optional[List[str]] = None
     condiciones: Optional[dict] = None
-    asesor_id: Optional[str] = None       # uuid del usuario autenticado (auth.uid())
+    asesor_id: Optional[str] = None       # uuid del perfil elegido (o del usuario autenticado)
+    asesor_nombre: Optional[str] = None   # si viene escrito a mano, tiene prioridad sobre asesor_id
+    asesor_celular: Optional[str] = None
+    asesor_correo: Optional[str] = None
     dias_validez: int = Field(default=30, description="Días hasta la fecha de vencimiento")
 
 
@@ -103,6 +106,37 @@ class CotizacionOut(BaseModel):
     subtotal: float
     igv: float
     total: float
+
+
+def resolver_asesor(sb: Client, payload: "CotizacionIn") -> Optional[dict]:
+    """Datos de asesor que van impresos en el documento.
+    Prioridad: si viene un nombre escrito a mano (asesor_nombre), se usa tal
+    cual. Si no, se busca el perfil correspondiente a asesor_id (asesor
+    elegido de la lista, o el usuario autenticado)."""
+    if payload.asesor_nombre and payload.asesor_nombre.strip():
+        return {
+            "nombre": payload.asesor_nombre.strip(),
+            "celular": (payload.asesor_celular or "").strip() or "-",
+            "correo": (payload.asesor_correo or "").strip() or "-",
+        }
+    if payload.asesor_id:
+        try:
+            perfil_res = (
+                sb.table("profiles")
+                .select("nombre, celular, correo")
+                .eq("id", payload.asesor_id)
+                .maybe_single()
+                .execute()
+            )
+            if perfil_res.data:
+                return {
+                    "nombre": perfil_res.data.get("nombre") or "-",
+                    "celular": perfil_res.data.get("celular") or "-",
+                    "correo": perfil_res.data.get("correo") or "-",
+                }
+        except Exception:
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -183,25 +217,8 @@ def crear_cotizacion(payload: CotizacionIn):
     igv = round(subtotal * payload.igv_pct / 100, 2) if payload.operacion_gravada else 0.0
     total = subtotal + igv
 
-    # 3.5) datos del asesor que está generando la cotización (perfil del usuario logueado)
-    asesor_dict = None
-    if payload.asesor_id:
-        try:
-            perfil_res = (
-                sb.table("profiles")
-                .select("nombre, celular, correo")
-                .eq("id", payload.asesor_id)
-                .maybe_single()
-                .execute()
-            )
-            if perfil_res.data:
-                asesor_dict = {
-                    "nombre": perfil_res.data.get("nombre") or "-",
-                    "celular": perfil_res.data.get("celular") or "-",
-                    "correo": perfil_res.data.get("correo") or "-",
-                }
-        except Exception:
-            asesor_dict = None  # si falla, generar_cotizacion usa su asesor por defecto
+    # 3.5) datos del asesor que va impreso en el documento
+    asesor_dict = resolver_asesor(sb, payload)
 
     # 4) generar el .docx y convertirlo a PDF en una carpeta temporal
     with tempfile.TemporaryDirectory() as tmp:
@@ -335,25 +352,8 @@ def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
     igv = round(subtotal * payload.igv_pct / 100, 2) if payload.operacion_gravada else 0.0
     total = subtotal + igv
 
-    # 3) datos del asesor (el mismo que ya tenía la cotización, salvo que el payload traiga otro)
-    asesor_dict = None
-    if payload.asesor_id:
-        try:
-            perfil_res = (
-                sb.table("profiles")
-                .select("nombre, celular, correo")
-                .eq("id", payload.asesor_id)
-                .maybe_single()
-                .execute()
-            )
-            if perfil_res.data:
-                asesor_dict = {
-                    "nombre": perfil_res.data.get("nombre") or "-",
-                    "celular": perfil_res.data.get("celular") or "-",
-                    "correo": perfil_res.data.get("correo") or "-",
-                }
-        except Exception:
-            asesor_dict = None
+    # 3) datos del asesor que va impreso en el documento
+    asesor_dict = resolver_asesor(sb, payload)
 
     # 4) regenerar el .docx y el PDF con el mismo número
     with tempfile.TemporaryDirectory() as tmp:
