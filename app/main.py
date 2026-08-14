@@ -112,14 +112,20 @@ def resolver_asesor(sb: Client, payload: "CotizacionIn") -> Optional[dict]:
     """Datos de asesor que van impresos en el documento.
     Prioridad: si viene un nombre escrito a mano (asesor_nombre), se usa tal
     cual. Si no, se busca el perfil correspondiente a asesor_id (asesor
-    elegido de la lista, o el usuario autenticado)."""
+    elegido de la lista, o el usuario autenticado).
+
+    Además, si el payload trae un asesor_id, se actualiza ese perfil con lo
+    que se haya escrito/elegido aquí, para que la próxima vez ya aparezca
+    correcto en el desplegable (reemplaza a la antigua página "Mi perfil")."""
+    asesor_dict = None
+
     if payload.asesor_nombre and payload.asesor_nombre.strip():
-        return {
+        asesor_dict = {
             "nombre": payload.asesor_nombre.strip(),
             "celular": (payload.asesor_celular or "").strip() or "-",
             "correo": (payload.asesor_correo or "").strip() or "-",
         }
-    if payload.asesor_id:
+    elif payload.asesor_id:
         try:
             perfil_res = (
                 sb.table("profiles")
@@ -129,14 +135,25 @@ def resolver_asesor(sb: Client, payload: "CotizacionIn") -> Optional[dict]:
                 .execute()
             )
             if perfil_res.data:
-                return {
+                asesor_dict = {
                     "nombre": perfil_res.data.get("nombre") or "-",
                     "celular": perfil_res.data.get("celular") or "-",
                     "correo": perfil_res.data.get("correo") or "-",
                 }
         except Exception:
-            return None
-    return None
+            asesor_dict = None
+
+    if payload.asesor_id and asesor_dict:
+        try:
+            sb.table("profiles").update({
+                "nombre": asesor_dict["nombre"],
+                "celular": None if asesor_dict["celular"] == "-" else asesor_dict["celular"],
+                "correo": None if asesor_dict["correo"] == "-" else asesor_dict["correo"],
+            }).eq("id", payload.asesor_id).execute()
+        except Exception:
+            pass  # no bloquear la generación del documento si esto falla
+
+    return asesor_dict
 
 
 # ---------------------------------------------------------------------------
