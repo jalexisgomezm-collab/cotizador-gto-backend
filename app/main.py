@@ -137,6 +137,26 @@ def crear_cotizacion(payload: CotizacionIn):
     igv = round(subtotal * payload.igv_pct / 100, 2) if payload.operacion_gravada else 0.0
     total = subtotal + igv
 
+    # 3.5) datos del asesor que está generando la cotización (perfil del usuario logueado)
+    asesor_dict = None
+    if payload.asesor_id:
+        try:
+            perfil_res = (
+                sb.table("profiles")
+                .select("nombre, celular, correo")
+                .eq("id", payload.asesor_id)
+                .maybe_single()
+                .execute()
+            )
+            if perfil_res.data:
+                asesor_dict = {
+                    "nombre": perfil_res.data.get("nombre") or "-",
+                    "celular": perfil_res.data.get("celular") or "-",
+                    "correo": perfil_res.data.get("correo") or "-",
+                }
+        except Exception:
+            asesor_dict = None  # si falla, generar_cotizacion usa su asesor por defecto
+
     # 4) generar el .docx y convertirlo a PDF en una carpeta temporal
     with tempfile.TemporaryDirectory() as tmp:
         docx_path = os.path.join(tmp, f"Cotizacion_{numero}.docx")
@@ -149,6 +169,7 @@ def crear_cotizacion(payload: CotizacionIn):
                 referencia=payload.referencia,
                 cliente=cliente_dict,
                 items=[Item(i.descripcion, i.cantidad, i.valor_unitario) for i in payload.items],
+                asesor=asesor_dict,
                 operacion_gravada=payload.operacion_gravada,
                 moneda_simbolo=payload.moneda_simbolo,
                 moneda_letras=payload.moneda_letras,
@@ -231,3 +252,4 @@ def listar_cotizaciones(limit: int = 50):
         .execute()
     )
     return res.data
+
