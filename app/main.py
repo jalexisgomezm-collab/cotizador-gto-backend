@@ -21,6 +21,7 @@ import tempfile
 from datetime import date, timedelta
 from typing import List, Optional
 
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -34,6 +35,7 @@ from cotizacion_core import generar_cotizacion, Item
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "cotizaciones")
+SUNAT_API_TOKEN = os.environ.get("SUNAT_API_TOKEN")
 
 _supabase: Optional[Client] = None
 
@@ -109,6 +111,50 @@ class CotizacionOut(BaseModel):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/sunat/ruc/{numero}")
+def consultar_ruc(numero: str):
+    """Consulta un RUC en SUNAT vía Decolecta/apis.net.pe y devuelve los
+    datos ya listos para llenar el formulario (razón social, dirección,
+    estado). Requiere la variable de entorno SUNAT_API_TOKEN."""
+    numero = numero.strip()
+    if len(numero) != 11 or not numero.isdigit():
+        raise HTTPException(status_code=400, detail="El RUC debe tener 11 dígitos.")
+    if not SUNAT_API_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="No está configurada la variable SUNAT_API_TOKEN en el backend.",
+        )
+
+    try:
+        resp = requests.get(
+            "https://api.decolecta.com/v1/sunat/ruc",
+            params={"numero": numero},
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {SUNAT_API_TOKEN}",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"No se pudo contactar a SUNAT: {exc}")
+
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="RUC no encontrado en SUNAT.")
+    if not resp.ok:
+        raise HTTPException(
+            status_code=502, detail=f"SUNAT/Decolecta respondió con error ({resp.status_code})."
+        )
+
+    data = resp.json()
+    return {
+        "ruc": data.get("numero_documento") or numero,
+        "razon_social": data.get("razon_social") or data.get("nombre_o_razon_social") or "",
+        "direccion": data.get("direccion") or data.get("direccion_completa") or "",
+        "estado": data.get("estado") or "",
+        "condicion": data.get("condicion") or "",
+    }
 
 
 @app.post("/api/cotizaciones", response_model=CotizacionOut)
