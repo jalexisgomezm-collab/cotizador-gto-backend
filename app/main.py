@@ -556,6 +556,7 @@ def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
         "condiciones": payload.condiciones,
         "docx_url": docx_url,
         "pdf_url": pdf_url,
+        "estado": "generada",
     }).eq("id", cotizacion_id).execute()
 
     # 7) reemplazar los ítems (borrar los anteriores e insertar los nuevos)
