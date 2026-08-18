@@ -191,10 +191,12 @@ def consultar_ruc(numero: str):
     try:
         resp = requests.get(
             "https://api.decolecta.com/v1/sunat/ruc",
-            params={"numero": numero},
+            params={"numero": numero, "token": SUNAT_API_TOKEN},
             headers={
                 "Accept": "application/json",
+                "Content-Type": "application/json",
                 "Authorization": f"Bearer {SUNAT_API_TOKEN}",
+                "User-Agent": "cotizador-gto/1.0",
             },
             timeout=10,
         )
@@ -205,7 +207,8 @@ def consultar_ruc(numero: str):
         raise HTTPException(status_code=404, detail="RUC no encontrado en SUNAT.")
     if not resp.ok:
         raise HTTPException(
-            status_code=502, detail=f"SUNAT/Decolecta respondió con error ({resp.status_code})."
+            status_code=502,
+            detail=f"SUNAT/Decolecta respondió con error ({resp.status_code}): {resp.text[:300]}",
         )
 
     data = resp.json()
