@@ -354,6 +354,78 @@ def listar_cotizaciones(limit: int = 50):
     return res.data
 
 
+class ClienteUpdateIn(BaseModel):
+    razon_social: str
+    ruc: Optional[str] = None
+    direccion: Optional[str] = None
+    contacto: Optional[str] = None
+    telefono: Optional[str] = None
+    correo: Optional[str] = None
+
+
+@app.get("/api/clientes")
+def listar_clientes():
+    sb = get_supabase()
+    res = sb.table("clientes").select("*").order("razon_social").execute()
+    return res.data
+
+
+@app.put("/api/clientes/{cliente_id}")
+def editar_cliente(cliente_id: str, payload: ClienteUpdateIn):
+    """Corrige un cliente del catálogo (p. ej. uno que quedó mal guardado
+    por un error de tipeo o un RUC duplicado en el documento original)."""
+    sb = get_supabase()
+    if not payload.razon_social.strip():
+        raise HTTPException(status_code=400, detail="La razón social es obligatoria.")
+
+    def limpio(v: Optional[str]) -> Optional[str]:
+        v = (v or "").strip()
+        return v or None
+
+    update_dict = {
+        "razon_social": payload.razon_social.strip(),
+        "ruc": limpio(payload.ruc),
+        "direccion": limpio(payload.direccion),
+        "contacto": limpio(payload.contacto),
+        "telefono": limpio(payload.telefono),
+        "correo": limpio(payload.correo),
+    }
+    try:
+        res = sb.table("clientes").update(update_dict).eq("id", cliente_id).execute()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "duplicate" in msg or "unique" in msg:
+            raise HTTPException(status_code=409, detail="Ya existe otro cliente con ese RUC.")
+        raise HTTPException(status_code=500, detail=f"No se pudo actualizar el cliente: {exc}")
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado.")
+    return res.data[0]
+
+
+@app.delete("/api/clientes/{cliente_id}")
+def eliminar_cliente(cliente_id: str):
+    """Elimina un cliente del catálogo. Se bloquea si tiene cotizaciones
+    asociadas, para no romper el historial."""
+    sb = get_supabase()
+    asociadas = (
+        sb.table("cotizaciones")
+        .select("id", count="exact")
+        .eq("cliente_id", cliente_id)
+        .limit(1)
+        .execute()
+    )
+    if asociadas.count and asociadas.count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="No se puede eliminar: este cliente tiene cotizaciones asociadas en el historial.",
+        )
+    try:
+        sb.table("clientes").delete().eq("id", cliente_id).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"No se pudo eliminar el cliente: {exc}")
+    return {"ok": True}
+
+
 @app.post("/api/cotizaciones/importar", response_model=CotizacionOut)
 async def importar_cotizacion(
     numero: str = Form(...),
