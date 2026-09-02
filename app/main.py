@@ -156,6 +156,28 @@ def resolver_asesor(sb: Client, payload: "CotizacionIn") -> Optional[dict]:
     return asesor_dict
 
 
+def guardar_contacto_cliente(sb: Client, cliente_id: str, nombre: str, telefono: str, correo: str) -> None:
+    """Guarda (o actualiza) un contacto de compras de este cliente. Un mismo
+    cliente puede tener varios contactos —uno por área o comprador— así que
+    esto NO sobrescribe el contacto principal del cliente: solo agrega/actualiza
+    una entrada en su lista de contactos, identificada por el nombre."""
+    nombre = (nombre or "").strip()
+    if not nombre or nombre == "-":
+        return
+    try:
+        sb.table("cliente_contactos").upsert(
+            {
+                "cliente_id": cliente_id,
+                "nombre": nombre,
+                "telefono": (telefono or "").strip() or None,
+                "correo": (correo or "").strip() or None,
+            },
+            on_conflict="cliente_id,nombre",
+        ).execute()
+    except Exception:
+        pass  # no bloquear la generación del documento si esto falla
+
+
 def _liberar_numero(sb: Client, numero: str) -> None:
     """Si algo falla después de sacar un número de cotización (antes de
     guardarla), devuelve ese número al contador para que no quede
@@ -242,6 +264,10 @@ def crear_cotizacion(payload: CotizacionIn):
         else:
             cliente_row = sb.table("clientes").insert(cliente_dict).execute()
         cliente_id = cliente_row.data[0]["id"]
+        guardar_contacto_cliente(
+            sb, cliente_id, cliente_dict.get("contacto", ""),
+            cliente_dict.get("telefono", ""), cliente_dict.get("correo", ""),
+        )
 
         # 3) calcular totales
         subtotal = sum(i.cantidad * i.valor_unitario for i in payload.items)
@@ -426,6 +452,33 @@ def eliminar_cliente(cliente_id: str):
     return {"ok": True}
 
 
+@app.get("/api/clientes/{cliente_id}/contactos")
+def listar_contactos_cliente(cliente_id: str):
+    """Lista los contactos (compradores) guardados para este cliente, para
+    poder elegir entre ellos al cotizar en vez de escribirlos de nuevo."""
+    sb = get_supabase()
+    res = (
+        sb.table("cliente_contactos")
+        .select("id, nombre, telefono, correo")
+        .eq("cliente_id", cliente_id)
+        .order("nombre")
+        .execute()
+    )
+    return res.data
+
+
+@app.delete("/api/clientes/{cliente_id}/contactos/{contacto_id}")
+def eliminar_contacto_cliente(cliente_id: str, contacto_id: str):
+    sb = get_supabase()
+    try:
+        sb.table("cliente_contactos").delete().eq("id", contacto_id).eq(
+            "cliente_id", cliente_id
+        ).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"No se pudo eliminar el contacto: {exc}")
+    return {"ok": True}
+
+
 @app.post("/api/cotizaciones/importar", response_model=CotizacionOut)
 async def importar_cotizacion(
     numero: str = Form(...),
@@ -553,6 +606,10 @@ def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
     else:
         cliente_row = sb.table("clientes").insert(cliente_dict).execute()
     cliente_id = cliente_row.data[0]["id"]
+    guardar_contacto_cliente(
+        sb, cliente_id, cliente_dict.get("contacto", ""),
+        cliente_dict.get("telefono", ""), cliente_dict.get("correo", ""),
+    )
 
     # 2) recalcular totales
     subtotal = sum(i.cantidad * i.valor_unitario for i in payload.items)
