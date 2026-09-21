@@ -684,3 +684,435 @@ def generar_cotizacion(
 
     doc.save(salida_path)
     return salida_path
+
+
+# ============================================================================
+# Versión en inglés (misma plantilla / estilos, textos traducidos)
+# ============================================================================
+
+CONDICIONES_DEFAULT_EN = {
+    "forma_pago": "30-day credit — negotiable invoice.",
+    "lugar_entrega": "To be coordinated with the client.",
+    "plazo_entrega": "To be coordinated with the client.",
+    "garantia": "6 months.",
+    "validez": "30 business days from the issue date.",
+    "penalidad": "50% of the total service amount.",
+}
+
+GARANTIA_EXCLUSIONES_DEFAULT_EN = [
+    "Damage resulting from improper or incorrect handling by the client.",
+    "Damage resulting from failure to follow the manufacturer's recommendations.",
+    "Damage resulting from improper transport or storage.",
+    "Damage due to carrier negligence, improper handling, or lack of protection against "
+    "adverse weather conditions.",
+    "Damage caused by negligence, vandalism, or accidents.",
+    "Signs of tampering, disassembly, or unauthorized changes or replacement of parts.",
+    "Signs of tampering with, or absence of, the GTO control plate.",
+]
+
+_MONEDA_LETRAS_EN = {
+    "DÓLARES AMERICANOS": "US Dollars",
+    "DOLARES AMERICANOS": "US Dollars",
+    "SOLES": "Soles (PEN)",
+}
+
+
+def moneda_letras_en(moneda_letras_es: str) -> str:
+    """Traduce la forma escrita de la moneda (para el encabezado 'IN WORDS'
+    y la fila de condiciones) a partir del valor en español guardado en la
+    cotización. Si no la reconoce, la deja tal cual (ya viene en mayúsculas)."""
+    return _MONEDA_LETRAS_EN.get((moneda_letras_es or "").strip().upper(), moneda_letras_es)
+
+
+_EN_UNIDADES = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+_EN_DIEZ_A_DIECINUEVE = ["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+                          "sixteen", "seventeen", "eighteen", "nineteen"]
+_EN_DECENAS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def _en_tres_digitos(n: int) -> str:
+    if n == 0:
+        return ""
+    c, resto = divmod(n, 100)
+    partes = []
+    if c:
+        partes.append(_EN_UNIDADES[c] + " hundred")
+    if resto:
+        if resto < 10:
+            partes.append(_EN_UNIDADES[resto])
+        elif resto < 20:
+            partes.append(_EN_DIEZ_A_DIECINUEVE[resto - 10])
+        else:
+            d, u = divmod(resto, 10)
+            partes.append(_EN_DECENAS[d] + ("-" + _EN_UNIDADES[u] if u else ""))
+    return " ".join(partes)
+
+
+def numero_a_letras_en(monto: float, moneda_letras: str = "US Dollars") -> str:
+    """Equivalente en inglés de numero_a_letras(), para la línea 'IN WORDS:'.
+    Ej: 12000.00 -> "Twelve thousand and 00/100 US Dollars"."""
+    entero = int(monto)
+    centavos = round((monto - entero) * 100)
+    if centavos == 100:
+        entero += 1
+        centavos = 0
+
+    if entero == 0:
+        letras = "zero"
+    else:
+        millones, resto = divmod(entero, 1_000_000)
+        miles, cientos = divmod(resto, 1000)
+        partes = []
+        if millones:
+            partes.append("one million" if millones == 1 else f"{_en_tres_digitos(millones)} million")
+        if miles:
+            partes.append("one thousand" if miles == 1 else f"{_en_tres_digitos(miles)} thousand")
+        if cientos:
+            partes.append(_en_tres_digitos(cientos))
+        letras = " ".join(p for p in partes if p)
+
+    texto = f"{letras} and {centavos:02d}/100 {moneda_letras}"
+    return texto[0].upper() + texto[1:]
+
+
+def generar_cotizacion_en(
+    salida_path: str,
+    numero_cotizacion: str,
+    fecha_emision: str,
+    fecha_vencimiento: str,
+    cliente: Dict[str, str],
+    items: List[Item],
+    referencia: str = "",
+    asesor: Optional[Dict[str, str]] = None,
+    moneda_simbolo: str = "US$",
+    moneda_letras: str = "US Dollars",
+    igv_pct: int = 18,
+    operacion_gravada: bool = True,
+    activities: Optional[List[str]] = None,
+    condiciones: Optional[Dict[str, str]] = None,
+    cuentas_bancarias: Optional[List[tuple]] = None,
+    garantia_texto: Optional[str] = None,
+    garantia_exclusiones: Optional[List[str]] = None,
+    empresa: Optional[Dict[str, str]] = None,
+    logo_path: Optional[str] = None,
+) -> str:
+    """Misma plantilla / estilos que generar_cotizacion(), pero con las
+    etiquetas y textos fijos en inglés. Los campos dinámicos (descripción de
+    ítems, condiciones personalizadas, actividades, referencia, garantía)
+    deben llegar YA traducidos por quien llama a esta función — este módulo
+    no traduce texto libre, solo arma el documento."""
+    asesor = asesor or {
+        "nombre": "Juan Alexis Gómez Mamani",
+        "celular": "921 502 895",
+        "correo": "servicios@gtoperu.com",
+    }
+    cond = {**CONDICIONES_DEFAULT_EN, **(condiciones or {})}
+    cuentas_bancarias = cuentas_bancarias or CUENTAS_BANCARIAS_DEFAULT
+    garantia_exclusiones = garantia_exclusiones or GARANTIA_EXCLUSIONES_DEFAULT_EN
+    empresa = {**EMPRESA_DEFAULT, **(empresa or {})}
+    logo_path = logo_path or DEFAULT_LOGO_PATH
+
+    def fmt_money(v):
+        return f"{moneda_simbolo} {v:,.2f}"
+
+    doc = Document()
+
+    section = doc.sections[0]
+    section.page_width = Cm(21.0)
+    section.page_height = Cm(29.7)
+    section.top_margin = Cm(1.3)
+    section.bottom_margin = Cm(1.3)
+    section.left_margin = Cm(1.5)
+    section.right_margin = Cm(1.5)
+
+    normal = doc.styles['Normal']
+    normal.font.name = FONT
+    normal.font.size = Pt(9.5)
+    normal.font.color.rgb = GRAY_TEXT
+    normal.paragraph_format.space_after = Pt(0)
+
+    # ---------------- Header ----------------
+    header_tbl = doc.add_table(rows=1, cols=2)
+    _remove_table_borders(header_tbl)
+    _set_col_widths(header_tbl, [12.0, 6.0])
+
+    left_cell = header_tbl.cell(0, 0)
+    left_cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+    p = left_cell.paragraphs[0]
+    p.paragraph_format.space_after = Pt(6)
+    if logo_path and os.path.exists(logo_path):
+        p.add_run().add_picture(logo_path, width=Cm(4.6))
+
+    address_lines = [
+        ("Registered office: ", empresa["sede_fiscal"]),
+        ("Operations office: ", empresa["sede_operativa"]),
+    ]
+    for label, addr in address_lines:
+        pp = left_cell.add_paragraph()
+        pp.paragraph_format.space_after = Pt(1)
+        _add_run(pp, label, bold=True, size=8.5, color=GRAY_TEXT)
+        _add_run(pp, addr, size=8.5, color=GRAY_TEXT)
+
+    for line in [f"Phone: {empresa['telefono']}   |   {empresa['correo']}", empresa["web"]]:
+        pp = left_cell.add_paragraph()
+        pp.paragraph_format.space_after = Pt(1)
+        _add_run(pp, line, size=8.5, color=GRAY_TEXT)
+
+    right_cell = header_tbl.cell(0, 1)
+    right_cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+    rp = right_cell.paragraphs[0]
+    rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    rp.paragraph_format.space_after = Pt(2)
+    _add_run(rp, "QUOTATION", bold=True, size=20, color=GREEN, caps=True, spacing=20)
+
+    rp2 = right_cell.add_paragraph()
+    rp2.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    rp2.paragraph_format.space_after = Pt(2)
+    _add_run(rp2, f"No. {numero_cotizacion}", bold=True, size=12.5, color=GREEN_DARK)
+
+    rp3 = right_cell.add_paragraph()
+    rp3.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    _add_run(rp3, f"Tax ID (R.U.C.) {empresa['ruc']}", size=9, color=GRAY_TEXT)
+
+    sep = doc.add_paragraph()
+    sep.paragraph_format.space_before = Pt(0)
+    sep.paragraph_format.space_after = Pt(8)
+    pPr = sep._p.get_or_add_pPr()
+    pBdr = OxmlElement('w:pBdr')
+    bottom = OxmlElement('w:bottom')
+    bottom.set(qn('w:val'), 'single')
+    bottom.set(qn('w:sz'), '18')
+    bottom.set(qn('w:space'), '1')
+    bottom.set(qn('w:color'), BRAND_GREEN_HEX)
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
+    # ---------------- Client / quote info ----------------
+    info_rows = [
+        ("Tax ID / ID No.", cliente.get("ruc", "-"), "Quote No.", numero_cotizacion),
+        ("Company name", cliente.get("razon_social", "-"), "Issue date", fecha_emision),
+        ("Address", cliente.get("direccion", "-"), "Valid until", fecha_vencimiento),
+        ("Contact", cliente.get("contacto", "-"), "Reference", referencia or "-"),
+        ("Phone", cliente.get("telefono", "-"), "Sales representative", asesor["nombre"]),
+        ("Email", cliente.get("correo", "-"), "Rep. phone / email",
+         f"{asesor['celular']} / {asesor['correo']}"),
+    ]
+
+    info_tbl = doc.add_table(rows=len(info_rows), cols=4)
+    info_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+    _set_col_widths(info_tbl, [3.6, 5.2, 4.0, 5.2])
+    for i, (l1, v1, l2, v2) in enumerate(info_rows):
+        row = info_tbl.rows[i]
+        for c in row.cells:
+            _set_cell_borders(c, color=BORDER_GRAY_HEX, sz=4)
+            _set_cell_margins(c, top=45, bottom=45, left=110, right=110)
+        _set_cell_shading(row.cells[0], GRAY_LIGHT_HEX)
+        _set_cell_shading(row.cells[2], GRAY_LIGHT_HEX)
+        _cell_text(row.cells[0], l1, bold=True, size=9, color=RGBColor(0x33, 0x33, 0x33))
+        _cell_text(row.cells[1], v1, size=9)
+        _cell_text(row.cells[2], l2, bold=True, size=9, color=RGBColor(0x33, 0x33, 0x33))
+        _cell_text(row.cells[3], v2, size=9)
+
+    _spacer(doc, SECTION_GAP)
+
+    # ---------------- Items table ----------------
+    items_tbl = doc.add_table(rows=1 + len(items), cols=5)
+    items_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+    _set_col_widths(items_tbl, [1.4, 8.6, 1.6, 3.1, 3.3])
+
+    headers = ["ITEM", "DESCRIPTION", "QTY.", f"UNIT PRICE ({moneda_simbolo})", f"AMOUNT ({moneda_simbolo})"]
+    for idx, h in enumerate(headers):
+        c = items_tbl.rows[0].cells[idx]
+        _set_cell_shading(c, BRAND_GREEN_HEX)
+        _set_cell_margins(c, top=70, bottom=70, left=100, right=100)
+        align = WD_ALIGN_PARAGRAPH.CENTER if idx != 1 else WD_ALIGN_PARAGRAPH.LEFT
+        _cell_text(c, h, bold=True, size=9, color=WHITE, align=align, caps=True)
+
+    subtotal_val = 0.0
+    for r_i, item in enumerate(items, start=1):
+        importe = item.cantidad * item.valor_unitario
+        subtotal_val += importe
+        row = items_tbl.rows[r_i]
+        fill = "FFFFFF" if r_i % 2 else GRAY_LIGHT_HEX
+        for c in row.cells:
+            _set_cell_shading(c, fill)
+            _set_cell_borders(c, color=BORDER_GRAY_HEX, sz=4)
+            _set_cell_margins(c, top=70, bottom=70, left=100, right=100)
+        _cell_text(row.cells[0], str(r_i), align=WD_ALIGN_PARAGRAPH.CENTER, size=9)
+        dcell = row.cells[1]
+        dcell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        dp = dcell.paragraphs[0]
+        dp.paragraph_format.space_after = Pt(0)
+        _add_run(dp, item.descripcion, size=9)
+        _cell_text(row.cells[2], f"{item.cantidad:g}", align=WD_ALIGN_PARAGRAPH.CENTER, size=9)
+        _cell_text(row.cells[3], f"{item.valor_unitario:,.2f}", align=WD_ALIGN_PARAGRAPH.RIGHT, size=9)
+        _cell_text(row.cells[4], f"{importe:,.2f}", align=WD_ALIGN_PARAGRAPH.RIGHT, size=9, bold=True)
+
+    _spacer(doc, SECTION_GAP)
+
+    # ---------------- Totals ----------------
+    igv_val = round(subtotal_val * igv_pct / 100, 2) if operacion_gravada else 0.0
+    total_val = subtotal_val + igv_val
+
+    tot_outer = doc.add_table(rows=1, cols=2)
+    _remove_table_borders(tot_outer)
+    _set_col_widths(tot_outer, [10.8, 7.2])
+    tot_outer.rows[0].cells[0].text = ""
+    tot_cell = tot_outer.rows[0].cells[1]
+
+    if operacion_gravada:
+        totals = [
+            ("Taxable amount", fmt_money(subtotal_val), False),
+            (f"VAT (IGV) ({igv_pct}%)", fmt_money(igv_val), False),
+            ("TOTAL AMOUNT", fmt_money(total_val), True),
+        ]
+    else:
+        totals = [
+            ("VAT-exempt amount", fmt_money(subtotal_val), False),
+            ("TOTAL AMOUNT", fmt_money(total_val), True),
+        ]
+
+    tot_tbl_holder = tot_cell.add_table(rows=len(totals), cols=2)
+    _set_col_widths(tot_tbl_holder, [4.0, 3.2])
+    _remove_table_borders(tot_tbl_holder)
+    for i, (label, val, strong) in enumerate(totals):
+        row = tot_tbl_holder.rows[i]
+        for c in row.cells:
+            _set_cell_margins(c, top=45, bottom=45, left=90, right=90)
+        bg = BRAND_GREEN_HEX if strong else GRAY_LIGHT_HEX
+        fg = WHITE if strong else GRAY_TEXT
+        _set_cell_shading(row.cells[0], bg)
+        _set_cell_shading(row.cells[1], bg)
+        _cell_text(row.cells[0], label, bold=strong, size=10 if strong else 9.5, color=fg, caps=strong)
+        _cell_text(row.cells[1], val, bold=strong, size=10 if strong else 9.5, color=fg,
+                   align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+    son_p = doc.add_paragraph()
+    son_p.paragraph_format.space_before = Pt(6)
+    son_p.paragraph_format.space_after = Pt(2)
+    _add_run(son_p, "IN WORDS: ", bold=True, size=9, color=RGBColor(0x33, 0x33, 0x33))
+    _add_run(son_p, numero_a_letras_en(total_val, moneda_letras) + ".", italic=True, size=9)
+
+    if not operacion_gravada:
+        igv_note_p = doc.add_paragraph()
+        igv_note_p.paragraph_format.space_after = Pt(2)
+        _add_run(igv_note_p, "Transaction not subject to VAT (IGV) — export of services "
+                              "(Article 33 of the Peruvian VAT Law).", italic=True, size=8, color=GRAY_TEXT)
+
+    _spacer(doc, SECTION_GAP)
+
+    # ---------------- Scope of service (optional) ----------------
+    if activities:
+        _section_bar(doc, "Scope of service")
+        for act in activities:
+            _bullet(doc, act, size=9.5)
+        _spacer(doc, SECTION_GAP)
+
+    # ---------------- Commercial terms ----------------
+    _section_bar(doc, "Commercial terms")
+    _bullet(doc, cond["forma_pago"], "Payment terms: ")
+    _bullet(doc, cond["lugar_entrega"], "Pickup / delivery location: ")
+    _bullet(doc, cond["plazo_entrega"], "Delivery time: ")
+    _bullet(doc, cond["garantia"], "Warranty: ")
+    _bullet(doc, cond["validez"], "Quote validity: ")
+    _bullet(doc, cond["penalidad"], "Cancellation penalty (purchase order): ")
+    _bullet(doc, f"{moneda_letras} ({moneda_simbolo}).", "Currency: ")
+    _spacer(doc, SECTION_GAP)
+
+    # ---------------- Warranty policy ----------------
+    _section_bar(doc, "Warranty policy")
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(5)
+    _add_run(p, garantia_texto or (
+        "GTO warrants its products and services for the period stated in the Commercial Terms "
+        "section of this quotation. To make a warranty claim, the client must notify GTO "
+        "immediately at " + empresa["correo"] + ", attaching a technical report supporting the "
+        "reported failure along with the corresponding photographic evidence."
+    ), size=9)
+    p2 = doc.add_paragraph()
+    p2.paragraph_format.space_after = Pt(5)
+    _add_run(p2, "GTO will have a period of 7 to 15 calendar days to evaluate the warranty claim "
+                 "and issue its acceptance or rejection through a technical report.", size=9)
+    p3 = doc.add_paragraph()
+    p3.paragraph_format.space_after = Pt(3)
+    _add_run(p3, "The warranty does not apply in the following cases:", bold=True, size=9,
+              color=RGBColor(0x33, 0x33, 0x33))
+    for e in garantia_exclusiones:
+        _bullet(doc, e, size=8.75)
+    p4 = doc.add_paragraph()
+    p4.paragraph_format.space_before = Pt(4)
+    p4.paragraph_format.space_after = Pt(2)
+    _add_run(p4, "GTO is not liable for loss of profit resulting from downtime of the equipment "
+                 "in which the component was installed.", italic=True, size=8.75)
+    _spacer(doc, SECTION_GAP)
+
+    # ---------------- Communication ----------------
+    _section_bar(doc, "Communication")
+    _bullet(doc, empresa["correo"], "Technical and sales inquiries: ")
+    _bullet(doc, empresa["correo_facturacion"], "Invoicing and changes: ")
+    _bullet(doc, "GTO commits to informing the client of any situation that may affect the "
+                 "service delivery time.")
+    _spacer(doc, SECTION_GAP)
+
+    # ---------------- Payment methods ----------------
+    _section_bar(doc, "Payment methods")
+    pay_tbl = doc.add_table(rows=1 + len(cuentas_bancarias), cols=4)
+    pay_tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+    _set_col_widths(pay_tbl, [3.5, 3.5, 5.5, 5.5])
+    for idx, h in enumerate(["Bank", "Currency", "Checking account", "CCI (interbank) account"]):
+        c = pay_tbl.rows[0].cells[idx]
+        _set_cell_shading(c, "D8E9DE")
+        _set_cell_margins(c, top=50, bottom=50, left=100, right=100)
+        _cell_text(c, h, bold=True, size=9, color=GREEN_DARK, align=WD_ALIGN_PARAGRAPH.CENTER)
+    for i, (b, m, cc, cci) in enumerate(cuentas_bancarias, start=1):
+        row = pay_tbl.rows[i]
+        fill = "FFFFFF" if i % 2 else GRAY_LIGHT_HEX
+        for c in row.cells:
+            _set_cell_shading(c, fill)
+            _set_cell_borders(c, color=BORDER_GRAY_HEX, sz=4)
+            _set_cell_margins(c, top=50, bottom=50, left=100, right=100)
+        _cell_text(row.cells[0], b, size=9)
+        _cell_text(row.cells[1], _MONEDA_LETRAS_EN.get((m or "").strip().upper(), m), size=9)
+        _cell_text(row.cells[2], cc, size=9)
+        _cell_text(row.cells[3], cci, size=9)
+
+    _spacer(doc, SECTION_GAP)
+    warn_tbl = doc.add_table(rows=1, cols=1)
+    _remove_table_borders(warn_tbl)
+    _set_col_widths(warn_tbl, [18.0])
+    wcell = warn_tbl.cell(0, 0)
+    _set_cell_shading(wcell, GREEN_LIGHT_HEX)
+    _set_cell_margins(wcell, top=80, bottom=80, left=180, right=150)
+    wBorders = OxmlElement('w:tcBorders')
+    wleft = OxmlElement('w:left')
+    wleft.set(qn('w:val'), 'single')
+    wleft.set(qn('w:sz'), '24')
+    wleft.set(qn('w:space'), '0')
+    wleft.set(qn('w:color'), BRAND_GREEN_HEX)
+    wBorders.append(wleft)
+    wcell._tc.get_or_add_tcPr().append(wBorders)
+    wp = wcell.paragraphs[0]
+    _add_run(wp, "Before making any payment, please confirm that the account and currency match "
+                 "the payment voucher issued by GTO. GTO is not responsible for deposits made to "
+                 "unverified accounts.", bold=True, size=8.5, color=GREEN_DARK)
+
+    # ---------------- Footer ----------------
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    fp = footer.paragraphs[0]
+    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    pPr = fp._p.get_or_add_pPr()
+    pBdr2 = OxmlElement('w:pBdr')
+    top = OxmlElement('w:top')
+    top.set(qn('w:val'), 'single'); top.set(qn('w:sz'), '4'); top.set(qn('w:space'), '4')
+    top.set(qn('w:color'), 'BFBFBF')
+    pBdr2.append(top)
+    pPr.append(pBdr2)
+    _add_run(fp, f"{empresa['nombre_footer']}   |   Tax ID (R.U.C.) {empresa['ruc']}   |   {empresa['web']}   |   Page ",
+              size=7.5, color=RGBColor(0x80, 0x80, 0x80))
+    _add_page_number_field(fp)
+    _add_run(fp, " of ", size=7.5, color=RGBColor(0x80, 0x80, 0x80))
+    _add_numpages_field(fp)
+
+    doc.save(salida_path)
+    return salida_path
