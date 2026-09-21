@@ -24,10 +24,11 @@ from typing import List, Optional
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
-from cotizacion_core import generar_cotizacion, Item
+from cotizacion_core import generar_cotizacion, generar_cotizacion_en, moneda_letras_en, Item
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -102,6 +103,7 @@ class CotizacionIn(BaseModel):
 
 
 class CotizacionOut(BaseModel):
+    id: Optional[str] = None
     numero: str
     docx_url: str
     pdf_url: str
@@ -358,7 +360,7 @@ def crear_cotizacion(payload: CotizacionIn):
         ]).execute()
 
         return CotizacionOut(
-            numero=numero, docx_url=docx_url, pdf_url=pdf_url,
+            id=cotizacion_id, numero=numero, docx_url=docx_url, pdf_url=pdf_url,
             subtotal=subtotal, igv=igv, total=total,
         )
     except HTTPException:
@@ -554,7 +556,7 @@ async def importar_cotizacion(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error subiendo los archivos: {exc}")
 
-    sb.table("cotizaciones").insert({
+    cot_row = sb.table("cotizaciones").insert({
         "numero": numero,
         "cliente_id": cliente_id,
         "asesor_id": None,
@@ -572,9 +574,10 @@ async def importar_cotizacion(
         "pdf_url": pdf_url or None,
         "estado": "importada",
     }).execute()
+    cotizacion_id = cot_row.data[0]["id"]
 
     return CotizacionOut(
-        numero=numero, docx_url=docx_url, pdf_url=pdf_url,
+        id=cotizacion_id, numero=numero, docx_url=docx_url, pdf_url=pdf_url,
         subtotal=subtotal, igv=igv, total=total,
     )
 
@@ -713,6 +716,132 @@ def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
     ]).execute()
 
     return CotizacionOut(
-        numero=numero, docx_url=docx_url, pdf_url=pdf_url,
+        id=cotizacion_id, numero=numero, docx_url=docx_url, pdf_url=pdf_url,
         subtotal=subtotal, igv=igv, total=total,
+    )
+
+
+@app.get("/api/cotizaciones/{cotizacion_id}/ingles")
+def descargar_cotizacion_ingles(cotizacion_id: str, formato: str = "pdf"):
+    """Genera al vuelo la versión en inglés de una cotización ya existente:
+    arma el documento con la plantilla en inglés (títulos, secciones y
+    textos fijos traducidos, mismo diseño/marca). Los campos de texto libre
+    (descripción de ítems, alcance del servicio, condiciones personalizadas,
+    referencia) se dejan tal como fueron escritos — no se traducen
+    automáticamente, para no depender de un servicio de traducción de pago.
+    No guarda nada ni modifica la cotización original en español."""
+    if formato not in ("pdf", "docx"):
+        raise HTTPException(status_code=400, detail="Formato inválido (usa pdf o docx).")
+
+    sb = get_supabase()
+    cot = (
+        sb.table("cotizaciones")
+        .select("*, clientes(ruc, razon_social, direccion, contacto, telefono, correo)")
+        .eq("id", cotizacion_id)
+        .maybe_single()
+        .execute()
+    )
+    if not cot.data:
+        raise HTTPException(status_code=404, detail="Cotización no encontrada.")
+    row = cot.data
+
+    if row.get("estado") == "importada":
+        raise HTTPException(
+            status_code=400,
+            detail="Esta cotización fue importada (archivo original, sin datos estructurados) "
+                   "y no se puede traducir automáticamente.",
+        )
+
+    items_res = (
+        sb.table("cotizacion_items")
+        .select("descripcion, cantidad, valor_unitario")
+        .eq("cotizacion_id", cotizacion_id)
+        .order("id")
+        .execute()
+    )
+    items_data = items_res.data or []
+    if not items_data:
+        raise HTTPException(status_code=400, detail="Esta cotización no tiene ítems.")
+
+    asesor_dict = None
+    if row.get("asesor_id"):
+        try:
+            perfil_res = (
+                sb.table("profiles")
+                .select("nombre, celular, correo")
+                .eq("id", row["asesor_id"])
+                .maybe_single()
+                .execute()
+            )
+            if perfil_res.data:
+                asesor_dict = {
+                    "nombre": perfil_res.data.get("nombre") or "-",
+                    "celular": perfil_res.data.get("celular") or "-",
+                    "correo": perfil_res.data.get("correo") or "-",
+                }
+        except Exception:
+            asesor_dict = None
+
+    cliente_dict = row.get("clientes") or {}
+    activities = row.get("activities") or None
+    condiciones_es = row.get("condiciones") or None
+    referencia = row.get("referencia") or ""
+
+    items_en = [
+        Item(it.get("descripcion", ""), it.get("cantidad", 1), it.get("valor_unitario", 0))
+        for it in items_data
+    ]
+
+    try:
+        fecha_emision_dt = date.fromisoformat(row["fecha_emision"])
+        fecha_vencimiento_dt = date.fromisoformat(row["fecha_vencimiento"])
+    except Exception:
+        raise HTTPException(status_code=500, detail="Fechas inválidas en la cotización.")
+
+    numero = row["numero"]
+    with tempfile.TemporaryDirectory() as tmp:
+        docx_path = os.path.join(tmp, f"Quotation_{numero}_EN.docx")
+        try:
+            generar_cotizacion_en(
+                salida_path=docx_path,
+                numero_cotizacion=numero,
+                fecha_emision=fecha_emision_dt.strftime("%m/%d/%Y"),
+                fecha_vencimiento=fecha_vencimiento_dt.strftime("%m/%d/%Y"),
+                referencia=referencia,
+                cliente=cliente_dict,
+                items=items_en,
+                asesor=asesor_dict,
+                operacion_gravada=row.get("operacion_gravada", True),
+                moneda_simbolo=row.get("moneda_simbolo", "US$"),
+                moneda_letras=moneda_letras_en(row.get("moneda_letras", "DÓLARES AMERICANOS")),
+                igv_pct=row.get("igv_pct", 18),
+                activities=activities,
+                condiciones=condiciones_es,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Error generando el Word en inglés: {exc}")
+
+        if formato == "docx":
+            salida_path = docx_path
+            media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            filename = f"Quotation_{numero}_EN.docx"
+        else:
+            try:
+                subprocess.run(
+                    ["soffice", "--headless", "--convert-to", "pdf", "--outdir", tmp, docx_path],
+                    check=True, timeout=60, capture_output=True,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Error convirtiendo a PDF: {exc}")
+            salida_path = docx_path[:-5] + ".pdf"
+            media_type = "application/pdf"
+            filename = f"Quotation_{numero}_EN.pdf"
+
+        with open(salida_path, "rb") as f:
+            contenido = f.read()
+
+    return Response(
+        content=contenido,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
