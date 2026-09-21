@@ -97,6 +97,8 @@ class CotizacionIn(BaseModel):
     asesor_celular: Optional[str] = None
     asesor_correo: Optional[str] = None
     dias_validez: int = Field(default=30, description="Días hasta la fecha de vencimiento")
+    fecha_emision: Optional[str] = None  # "YYYY-MM-DD"; solo se usa al editar, para corregirla sin
+                                          # afectar el número (crear_cotizacion siempre usa hoy)
 
 
 class CotizacionOut(BaseModel):
@@ -596,7 +598,13 @@ def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
         raise HTTPException(status_code=404, detail="Cotización no encontrada.")
 
     numero = existente.data["numero"]
-    fecha_emision = date.fromisoformat(existente.data["fecha_emision"])
+    if payload.fecha_emision:
+        try:
+            fecha_emision = date.fromisoformat(payload.fecha_emision)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Fecha de emisión inválida.")
+    else:
+        fecha_emision = date.fromisoformat(existente.data["fecha_emision"])
     vencimiento = fecha_emision + timedelta(days=payload.dias_validez)
 
     # 1) upsert del cliente (por RUC, si lo tiene) — igual que en creación
@@ -676,6 +684,7 @@ def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
         "cliente_id": cliente_id,
         "asesor_id": payload.asesor_id,
         "referencia": payload.referencia,
+        "fecha_emision": fecha_emision.isoformat(),
         "fecha_vencimiento": vencimiento.isoformat(),
         "moneda_simbolo": payload.moneda_simbolo,
         "moneda_letras": payload.moneda_letras,
