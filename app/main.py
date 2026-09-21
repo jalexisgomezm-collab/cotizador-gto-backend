@@ -22,7 +22,7 @@ from datetime import date, timedelta
 from typing import List, Optional
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -182,6 +182,32 @@ def guardar_contacto_cliente(sb: Client, cliente_id: str, nombre: str, telefono:
         pass  # no bloquear la generación del documento si esto falla
 
 
+def usuario_actual(sb: Client, authorization: Optional[str] = None) -> Optional[dict]:
+    """Identifica al usuario autenticado a partir del token que manda el
+    frontend (header 'Authorization: Bearer <token>') y si es administrador
+    (ve todas las cotizaciones) o vendedor normal (solo las suyas).
+    Devuelve None si no viene token o no es válido — en ese caso el llamador
+    trata la petición como si no supiera quién es (modo abierto, para no
+    romper nada si el frontend todavía no manda el token)."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    try:
+        user_res = sb.auth.get_user(token)
+        uid = user_res.user.id
+    except Exception:
+        return None
+    es_admin = False
+    try:
+        perfil = sb.table("profiles").select("es_admin").eq("id", uid).maybe_single().execute()
+        es_admin = bool(perfil.data and perfil.data.get("es_admin"))
+    except Exception:
+        pass
+    return {"uid": uid, "es_admin": es_admin}
+
+
 def _liberar_numero(sb: Client, numero: str) -> None:
     """Si algo falla después de sacar un número de cotización (antes de
     guardarla), devuelve ese número al contador para que no quede
@@ -248,8 +274,17 @@ def consultar_ruc(numero: str):
 
 
 @app.post("/api/cotizaciones", response_model=CotizacionOut)
-def crear_cotizacion(payload: CotizacionIn):
+def crear_cotizacion(payload: CotizacionIn, authorization: Optional[str] = Header(None)):
     sb = get_supabase()
+
+    # Si el que llama es un vendedor normal (no administrador), la cotización
+    # queda siempre a su propio nombre, sin importar lo que haya llegado en
+    # el payload — así su plantilla siempre muestra sus propios datos y
+    # nadie puede emitir "a nombre de" otro vendedor por error.
+    usuario = usuario_actual(sb, authorization)
+    if usuario and not usuario["es_admin"]:
+        payload.asesor_id = usuario["uid"]
+        payload.asesor_nombre = None
 
     # 1) número correlativo (función SQL definida en supabase/schema.sql)
     numero_res = sb.rpc("siguiente_numero_cotizacion", {}).execute()
@@ -372,15 +407,21 @@ def crear_cotizacion(payload: CotizacionIn):
 
 
 @app.get("/api/cotizaciones")
-def listar_cotizaciones(limit: int = 50):
+def listar_cotizaciones(limit: int = 50, authorization: Optional[str] = Header(None)):
     sb = get_supabase()
-    res = (
+    q = (
         sb.table("cotizaciones")
         .select("*, clientes(razon_social, ruc)")
         .order("created_at", desc=True)
         .limit(limit)
-        .execute()
     )
+    # Un vendedor normal (no administrador) solo ve sus propias cotizaciones.
+    # Si no llega token (frontend viejo, o falla la verificación), se
+    # devuelve todo — igual que antes — para no romper nada.
+    usuario = usuario_actual(sb, authorization)
+    if usuario and not usuario["es_admin"]:
+        q = q.eq("asesor_id", usuario["uid"])
+    res = q.execute()
     return res.data
 
 
@@ -583,7 +624,9 @@ async def importar_cotizacion(
 
 
 @app.put("/api/cotizaciones/{cotizacion_id}", response_model=CotizacionOut)
-def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
+def editar_cotizacion(
+    cotizacion_id: str, payload: CotizacionIn, authorization: Optional[str] = Header(None)
+):
     """Corrige una cotización ya existente y regenera el Word/PDF.
     Mantiene el mismo número correlativo y la misma fecha de emisión;
     todo lo demás (cliente, ítems, condiciones, moneda, etc.) se
@@ -592,13 +635,24 @@ def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
 
     existente = (
         sb.table("cotizaciones")
-        .select("numero, fecha_emision")
+        .select("numero, fecha_emision, asesor_id")
         .eq("id", cotizacion_id)
         .maybe_single()
         .execute()
     )
     if not existente.data:
         raise HTTPException(status_code=404, detail="Cotización no encontrada.")
+
+    # Un vendedor normal (no administrador) no puede editar cotizaciones
+    # ajenas, y las suyas quedan siempre a su propio nombre.
+    usuario = usuario_actual(sb, authorization)
+    if usuario and not usuario["es_admin"]:
+        if existente.data.get("asesor_id") != usuario["uid"]:
+            raise HTTPException(
+                status_code=403, detail="No puedes editar una cotización de otro vendedor."
+            )
+        payload.asesor_id = usuario["uid"]
+        payload.asesor_nombre = None
 
     numero = existente.data["numero"]
     if payload.fecha_emision:
@@ -722,7 +776,9 @@ def editar_cotizacion(cotizacion_id: str, payload: CotizacionIn):
 
 
 @app.get("/api/cotizaciones/{cotizacion_id}/ingles")
-def descargar_cotizacion_ingles(cotizacion_id: str, formato: str = "pdf"):
+def descargar_cotizacion_ingles(
+    cotizacion_id: str, formato: str = "pdf", authorization: Optional[str] = Header(None)
+):
     """Genera al vuelo la versión en inglés de una cotización ya existente:
     arma el documento con la plantilla en inglés (títulos, secciones y
     textos fijos traducidos, mismo diseño/marca). Los campos de texto libre
@@ -744,6 +800,12 @@ def descargar_cotizacion_ingles(cotizacion_id: str, formato: str = "pdf"):
     if not cot.data:
         raise HTTPException(status_code=404, detail="Cotización no encontrada.")
     row = cot.data
+
+    usuario = usuario_actual(sb, authorization)
+    if usuario and not usuario["es_admin"] and row.get("asesor_id") != usuario["uid"]:
+        raise HTTPException(
+            status_code=403, detail="No puedes descargar una cotización de otro vendedor."
+        )
 
     if row.get("estado") == "importada":
         raise HTTPException(
