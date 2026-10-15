@@ -555,7 +555,7 @@ async def importar_cotizacion(
         raise HTTPException(status_code=400, detail="El número de cotización es obligatorio.")
 
     existe = sb.table("cotizaciones").select("id").eq("numero", numero).maybe_single().execute()
-    if existe.data:
+    if existe is not None and existe.data:
         raise HTTPException(
             status_code=400, detail=f"Ya existe una cotización con el número {numero}."
         )
