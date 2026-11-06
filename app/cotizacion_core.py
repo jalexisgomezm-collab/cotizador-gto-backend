@@ -293,6 +293,35 @@ def _bullet(doc, text, bold_prefix=None, size=9.5, color=GRAY_TEXT):
     return p
 
 
+_MARCAS_VINETA = ('-', '•', '*', '·', '–', '—')
+
+
+def _es_vineta(texto):
+    return (texto or '').lstrip()[:1] in _MARCAS_VINETA
+
+
+def _alcance(doc, activities, size=9.5):
+    """Alcance del servicio.
+    - Las líneas que empiezan con guion (o •, *) se muestran como viñeta.
+    - Las demás se muestran como texto normal; si terminan en ':' van en negrita (subtítulo).
+    - Si ninguna línea tiene guion (cotizaciones antiguas), todas salen como viñeta.
+    """
+    lineas = [a for a in (activities or []) if a and str(a).strip()]
+    hay_marcas = any(_es_vineta(a) for a in lineas)
+    for act in lineas:
+        texto = str(act).strip()
+        if not hay_marcas:
+            _bullet(doc, texto, size=size)
+        elif _es_vineta(texto):
+            _bullet(doc, texto[1:].strip(), size=size)
+        else:
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(4)
+            p.paragraph_format.space_after = Pt(2)
+            p.paragraph_format.keep_with_next = texto.endswith(':')
+            _add_run(p, texto, bold=texto.endswith(':'), size=size, color=RGBColor(0x2A, 0x2A, 0x2A))
+
+
 def _section_bar(doc, title):
     table = doc.add_table(rows=1, cols=1)
     _remove_table_borders(table)
@@ -572,8 +601,7 @@ def generar_cotizacion(
     # ---------------- Alcance del servicio (condicional) ----------------
     if activities:
         _section_bar(doc, "Alcance del servicio")
-        for act in activities:
-            _bullet(doc, act, size=9.5)
+        _alcance(doc, activities, size=9.5)
         _spacer(doc, SECTION_GAP)
 
     # ---------------- Condiciones comerciales ----------------
@@ -1004,8 +1032,7 @@ def generar_cotizacion_en(
     # ---------------- Scope of service (optional) ----------------
     if activities:
         _section_bar(doc, "Scope of service")
-        for act in activities:
-            _bullet(doc, act, size=9.5)
+        _alcance(doc, activities, size=9.5)
         _spacer(doc, SECTION_GAP)
 
     # ---------------- Commercial terms ----------------
