@@ -223,7 +223,7 @@ def _liberar_numero(sb: Client, numero: str) -> None:
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "alcance-vinetas-2026-11"}
 
 
 @app.get("/api/sunat/ruc/{numero}")
