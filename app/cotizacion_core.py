@@ -285,6 +285,7 @@ def _spacer(doc, pts=8):
 
 def _bullet(doc, text, bold_prefix=None, size=9.5, color=GRAY_TEXT):
     p = doc.add_paragraph(style='List Bullet')
+    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     p.paragraph_format.space_after = Pt(3)
     p.paragraph_format.left_indent = Cm(0.5)
     if bold_prefix:
@@ -316,6 +317,7 @@ def _alcance(doc, activities, size=9.5):
             _bullet(doc, texto[1:].strip(), size=size)
         else:
             p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             p.paragraph_format.space_before = Pt(4)
             p.paragraph_format.space_after = Pt(2)
             p.paragraph_format.keep_with_next = texto.endswith(':')
