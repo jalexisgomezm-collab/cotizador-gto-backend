@@ -22,7 +22,7 @@ from datetime import date, timedelta
 from typing import List, Optional
 
 import requests
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -200,12 +200,31 @@ def usuario_actual(sb: Client, authorization: Optional[str] = None) -> Optional[
     except Exception:
         return None
     es_admin = False
+    autorizado = False
     try:
-        perfil = sb.table("profiles").select("es_admin").eq("id", uid).maybe_single().execute()
+        perfil = sb.table("profiles").select("es_admin, autorizado").eq("id", uid).maybe_single().execute()
         es_admin = bool(perfil.data and perfil.data.get("es_admin"))
+        autorizado = es_admin or bool(perfil.data and perfil.data.get("autorizado"))
     except Exception:
         pass
-    return {"uid": uid, "es_admin": es_admin}
+    return {"uid": uid, "es_admin": es_admin, "autorizado": autorizado}
+
+
+# Seguridad (19/11/2026, aprobado por Alexis): el servidor ya no responde sin sesión.
+# Solo entran usuarios autorizados por un administrador; algunas acciones son solo de administrador.
+def requiere_usuario(authorization: Optional[str] = Header(None)) -> dict:
+    usuario = usuario_actual(get_supabase(), authorization)
+    if not usuario:
+        raise HTTPException(status_code=401, detail="Inicia sesión para usar el Cotizador.")
+    if not usuario.get("autorizado"):
+        raise HTTPException(status_code=403, detail="Tu usuario no está autorizado para usar el Cotizador.")
+    return usuario
+
+
+def requiere_admin(usuario: dict = Depends(requiere_usuario)) -> dict:
+    if not usuario.get("es_admin"):
+        raise HTTPException(status_code=403, detail="Solo un administrador puede hacer esto.")
+    return usuario
 
 
 def _liberar_numero(sb: Client, numero: str) -> None:
@@ -223,11 +242,11 @@ def _liberar_numero(sb: Client, numero: str) -> None:
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "alcance-vinetas-2026-11"}
+    return {"status": "ok", "version": "seguridad-sesion-2026-11-19"}
 
 
 @app.get("/api/sunat/ruc/{numero}")
-def consultar_ruc(numero: str):
+def consultar_ruc(numero: str, _usuario: dict = Depends(requiere_usuario)):
     """Consulta un RUC en SUNAT vía Decolecta/apis.net.pe y devuelve los
     datos ya listos para llenar el formulario (razón social, dirección,
     estado). Requiere la variable de entorno SUNAT_API_TOKEN."""
@@ -274,7 +293,7 @@ def consultar_ruc(numero: str):
 
 
 @app.post("/api/cotizaciones", response_model=CotizacionOut)
-def crear_cotizacion(payload: CotizacionIn, authorization: Optional[str] = Header(None)):
+def crear_cotizacion(payload: CotizacionIn, authorization: Optional[str] = Header(None), _usuario: dict = Depends(requiere_usuario)):
     sb = get_supabase()
 
     # Si el que llama es un vendedor normal (no administrador), la cotización
@@ -407,7 +426,7 @@ def crear_cotizacion(payload: CotizacionIn, authorization: Optional[str] = Heade
 
 
 @app.get("/api/cotizaciones")
-def listar_cotizaciones(limit: int = 50, authorization: Optional[str] = Header(None)):
+def listar_cotizaciones(limit: int = 50, authorization: Optional[str] = Header(None), _usuario: dict = Depends(requiere_usuario)):
     sb = get_supabase()
     q = (
         sb.table("cotizaciones")
@@ -435,14 +454,14 @@ class ClienteUpdateIn(BaseModel):
 
 
 @app.get("/api/clientes")
-def listar_clientes():
+def listar_clientes(_usuario: dict = Depends(requiere_usuario)):
     sb = get_supabase()
     res = sb.table("clientes").select("*").order("razon_social").execute()
     return res.data
 
 
 @app.put("/api/clientes/{cliente_id}")
-def editar_cliente(cliente_id: str, payload: ClienteUpdateIn):
+def editar_cliente(cliente_id: str, payload: ClienteUpdateIn, _usuario: dict = Depends(requiere_usuario)):
     """Corrige un cliente del catálogo (p. ej. uno que quedó mal guardado
     por un error de tipeo o un RUC duplicado en el documento original)."""
     sb = get_supabase()
@@ -474,7 +493,7 @@ def editar_cliente(cliente_id: str, payload: ClienteUpdateIn):
 
 
 @app.delete("/api/clientes/{cliente_id}")
-def eliminar_cliente(cliente_id: str):
+def eliminar_cliente(cliente_id: str, _admin: dict = Depends(requiere_admin)):
     """Elimina un cliente del catálogo. Se bloquea si tiene cotizaciones
     asociadas, para no romper el historial."""
     sb = get_supabase()
@@ -498,7 +517,7 @@ def eliminar_cliente(cliente_id: str):
 
 
 @app.get("/api/clientes/{cliente_id}/contactos")
-def listar_contactos_cliente(cliente_id: str):
+def listar_contactos_cliente(cliente_id: str, _usuario: dict = Depends(requiere_usuario)):
     """Lista los contactos (compradores) guardados para este cliente, para
     poder elegir entre ellos al cotizar en vez de escribirlos de nuevo."""
     sb = get_supabase()
@@ -513,7 +532,7 @@ def listar_contactos_cliente(cliente_id: str):
 
 
 @app.delete("/api/clientes/{cliente_id}/contactos/{contacto_id}")
-def eliminar_contacto_cliente(cliente_id: str, contacto_id: str):
+def eliminar_contacto_cliente(cliente_id: str, contacto_id: str, _admin: dict = Depends(requiere_admin)):
     sb = get_supabase()
     try:
         sb.table("cliente_contactos").delete().eq("id", contacto_id).eq(
@@ -542,6 +561,7 @@ async def importar_cotizacion(
     total: float = Form(0),
     docx: UploadFile = File(...),
     pdf: Optional[UploadFile] = File(None),
+    _admin: dict = Depends(requiere_admin),
 ):
     """Registra una cotización hecha ANTES de este sistema: guarda sus
     archivos Word/PDF originales tal cual (no se regeneran) y crea la fila
@@ -625,7 +645,8 @@ async def importar_cotizacion(
 
 @app.put("/api/cotizaciones/{cotizacion_id}", response_model=CotizacionOut)
 def editar_cotizacion(
-    cotizacion_id: str, payload: CotizacionIn, authorization: Optional[str] = Header(None)
+    cotizacion_id: str, payload: CotizacionIn, authorization: Optional[str] = Header(None),
+    _usuario: dict = Depends(requiere_usuario),
 ):
     """Corrige una cotización ya existente y regenera el Word/PDF.
     Mantiene el mismo número correlativo y la misma fecha de emisión;
@@ -777,7 +798,8 @@ def editar_cotizacion(
 
 @app.get("/api/cotizaciones/{cotizacion_id}/ingles")
 def descargar_cotizacion_ingles(
-    cotizacion_id: str, formato: str = "pdf", authorization: Optional[str] = Header(None)
+    cotizacion_id: str, formato: str = "pdf", authorization: Optional[str] = Header(None),
+    _usuario: dict = Depends(requiere_usuario),
 ):
     """Genera al vuelo la versión en inglés de una cotización ya existente:
     arma el documento con la plantilla en inglés (títulos, secciones y
